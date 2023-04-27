@@ -14,7 +14,7 @@ HEADERSIZE = 64
 BYTE_ORDER = 'little'
 PREP = 'prep'
 QUERY = 'query'
-BYE = 'bye'
+
 
 def encode_msg(msg):
 	raw_msg = pickle.dumps(msg)
