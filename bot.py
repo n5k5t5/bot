@@ -4,17 +4,22 @@ Python package for running workers
 from sys import stdin, stdout
 import os
 import pickle
-from queue import Queue
+from collections import deque
 from subprocess import Popen, PIPE
-from threading import Thread
-from time import sleep
-
+from threading import Thread, Event
+from time import sleep, time
+from queue import Queue, Empty
 
 HEADERSIZE = 64
 BYTE_ORDER = 'little'
 PREP = 'prep'
 QUERY = 'query'
-
+BYE = 'bye'
+TASK_READY = 'task_ready'
+CLOSING = 'closing'
+READY = 'ready'
+SAMPLE_SIZE = 100
+MAX_WORKERS = 100
 
 def encode_msg(msg):
 	raw_msg = pickle.dumps(msg)
@@ -38,7 +43,7 @@ def send_msg(msg, out_stream, logstream=None):
 	write_log(f'wrote header of len {len(header)}')
 	out_stream.write(raw_msg)
 	out_stream.flush()
-	write_log(f'wrote msg of len {len(raw_msg)}')
+	write_log(f'wrote msg of len {len(raw_msg)}:')
 	write_log(f'raw msg={raw_msg}')
 
 
@@ -67,58 +72,211 @@ def read_msg(in_stream, logstream=None):
 def start_bot(processor, preprocessor=None, logstream=None):
 	def write_log(msg):
 		print(os.getpid(), ':', msg, file=logstream) if logstream else None
+
 	while True:
-		msg, success = read_msg(stdin.buffer, logstream=logstream)
-		if not success:
-			write_log('eof')
-			return
-		kind, data = msg
-		if kind == PREP and preprocessor:
-			params = preprocessor(data)
-			send_msg([kind, True], stdout.buffer, logstream=logstream)
-		elif kind == QUERY:
-			response = processor(data, params) if preprocessor else processor(data) 
-			send_msg([kind, response], stdout.buffer, logstream=logstream)
-
-
-def man_bot(process, param, in_queue, results, logstream=None):
-	print(f'manning process {process.pid}')
-	if param:
-		send_msg([PREP, param], process.stdin, logstream=logstream)
-		msg, success = read_msg(process.stdout, logstream=logstream)
-		assert success
-	while in_queue.unfinished_tasks:
-		i, job = in_queue.get()
-		print(f'got job {i} from the queue')
 		try:
-			send_msg([QUERY, job], process.stdin, logstream=logstream)
-			print('sent...')
+			msg, success = read_msg(stdin.buffer, logstream=logstream)
+			if not success:
+				write_log('eof')
+				return
+			kind, content = msg
+			if kind == PREP:
+				if preprocessor:
+					params = preprocessor(content)
+				send_msg([kind, True], stdout.buffer, logstream=logstream)
+			elif kind == QUERY:
+				index, data = content
+				result = processor(data, params) if preprocessor else processor(data)
+				response = [index, result]
+				send_msg([kind, response], stdout.buffer, logstream=logstream)
+		except:
+			pass
+
+
+def man_bot(worker, param, in_queue, out_queue, logstream=None):
+	def write_log(msg):
+		print(os.getpid(), ':', msg, file=logstream) if logstream else None
+
+	process = worker.process
+	print(os.getpid(), ':', f'Handling process {process.pid}...')
+
+	send_msg([PREP, param], process.stdin, logstream=logstream)
+	msg, success = read_msg(process.stdout, logstream=logstream)
+	if not success:
+		write_log(f'pid {process.pid} is dead')
+	else:
+		if msg == [PREP, True]:
+			worker.greenlight.set()
+				
+	while worker.greenlight.wait():
+		try:
+			item = in_queue.popleft()
+		except IndexError:
+			worker.pause() # because no tasks left
+			continue
+		write_log(f'got job {item[0]} from the queue')
+
+		try:
+			send_msg([QUERY, item], process.stdin, logstream=logstream)
 			msg, success = read_msg(process.stdout, logstream=logstream)
 			assert success
 			kind, result = msg
 		except Exception as ex:
-			in_queue.put([i, job])
-			print(ex)
-			sleep(5)
+			in_queue.appendleft(item)
+			if process.poll() is not None:
+				print(os.getpid(), ':', f'the process {process.pid} has quit')
+				return
 		else:
-			results.put([i, result])
-			in_queue.task_done()
-			print(f'task {i} is done')
-	process.stdin.close()
+			out_queue.put([result, time()])
+			write_log(f'task {result[0]} is done')
+
+
+class Worker:
+	def __init__(self):
+		self.process = None
+		self.status = None
+		self.greenlight = Event()
+
+	def pause(self):
+		self.greenlight.clear()
 		
+	def resume(self):
+		self.greenlight.set()
+
 
 class Pool:
-	def __init__(self, command, tasks, num_workers, setup=None, logstream=None):
-		self.tasks = Queue()
-		for i, task in enumerate(tasks):
-			self.tasks.put([i, task])
-		self.results = Queue()
-		self.processes = []
+	def __init__(self, command, tasks, setup=None, logstream=None):
+		self.command = command
+		self.tasks = deque(enumerate(tasks))
+		self.out_queue = Queue()
+		self.workers = []
 		self.threads = []
-		for i in range(num_workers):
-			process = Popen(command, stdin=PIPE, stdout=PIPE, text=False)
-			print(f'launched process with pid = {process.pid}')
-			thread = Thread(target=man_bot, args=[process, setup, self.tasks, self.results], kwargs={'logstream': logstream}, daemon=True)
+		self.setup = setup
+		self.logstream = logstream
+
+	def add_workers(self, num_workers, logstream=None):
+		logstream = logstream or self.logstream
+		for _ in range(num_workers):
+			worker = Worker()
+			worker.process = Popen(self.command, stdin=PIPE, stdout=PIPE, text=False)
+			print(os.getpid(), ':', f'Launched process with pid = {worker.process.pid}')
+			thread = Thread(target=man_bot, args=[worker, self.setup, self.tasks, self.out_queue], kwargs={'logstream': logstream}, daemon=True)
 			thread.start()
-			self.processes.append(process)
+			self.workers.append(worker)
 			self.threads.append(thread)
+		for _ in range(num_workers):
+			for worker in self.workers[len(self.workers) - num_workers:]:
+				worker.greenlight.wait()
+
+	def close(self):
+		for w in self.workers:
+			w.process.kill()
+			w.process.wait()
+			print(f'{w.process.pid} exited with {w.process.poll()}')
+
+
+class TimelyPool(Pool):
+	def __init__(self, command, tasks, setup=None, logstream=None, tta=None):
+		super().__init__(command, tasks, setup=setup, logstream=logstream)
+		self.tta = tta
+		self.results = deque()
+		self.active_workers = []
+		self.sleeping_workers = []
+		self.original_load = len(self.tasks)	
+		global SAMPLE_SIZE
+		SAMPLE_SIZE = len(tasks) // 100
+	def add_workers(self, deficit):
+		if deficit > 0:
+			to_awaken = min(deficit, len(self.sleeping_workers))
+			for _ in range(to_awaken):
+				worker = self.sleeping_workers.pop()
+				worker.resume()
+				self.active_workers.append(worker)
+			if deficit > to_awaken:
+				super().add_workers(deficit - to_awaken)
+				self.active_workers.extend(self.workers[to_awaken - deficit:])
+		else:
+			for _ in range(-deficit):
+				worker = self.active_workers.pop()
+				worker.pause()
+				self.sleeping_workers.append(worker)
+		print(f'num workers = {len(self.active_workers)}')
+
+	def run(self, num_workers=1, speed_adj=10):
+		self.start_time = time()
+		# self.add_workers(100)		
+		# self.add_workers(num_workers - 100)
+		self.add_workers(num_workers)
+		if speed_adj:
+			i = 1
+			while len(self.tasks):
+				self.adjust_speed()
+				print(f'doing a prod run # {i}...')
+				self.partial_run(self.original_load // speed_adj)
+				i += 1
+
+		while len(self.results) < self.original_load:
+			self.results.append(self.out_queue.get())
+
+		print(f'target runtime {self.tta - self.start_time}, actual: {time() - self.start_time}')
+
+	@staticmethod
+	def flush_queue(source: Queue, target: list):
+		while True:
+			try:
+				target.append(source.get_nowait())
+			except:
+				break
+
+	def partial_run(self, num_tasks):
+		TimelyPool.flush_queue(self.out_queue, self.results)
+		tasks_to_do = min(num_tasks, self.original_load - len(self.results))
+		elapsed_time  = 0
+		if tasks_to_do:
+			start_time = time()
+			for _ in range(tasks_to_do):
+				self.results.append(self.out_queue.get())
+			elapsed_time = time() - start_time
+			speed = tasks_to_do / elapsed_time if elapsed_time else float("inf")
+			print(f'speed = {speed}, elapsed = {elapsed_time}')
+		return tasks_to_do, elapsed_time
+
+
+	def target_speed(self):
+		time_remains = max(self.tta - time(), 1)
+		tasks_remain = self.original_load - self.out_queue.qsize()
+		target_speed = tasks_remain / time_remains if tasks_remain else None
+		print(f'target speed = {target_speed}')
+		return target_speed
+	
+	def adjust_speed(self):
+		print('adjusting speed...')
+		target_speed = self.target_speed()
+		speed = self.measure_speed()
+		while len(self.active_workers) < MAX_WORKERS:
+			if not target_speed:
+				return
+			if speed < target_speed:
+				self.add_workers(1)
+				new_speed = self.measure_speed()
+				if new_speed < speed:
+					self.add_workers(-1)
+				else:
+					speed = new_speed
+					continue
+			elif speed > 1.5 * target_speed and len(self.active_workers) > 1:
+				self.add_workers(-1)
+				speed = self.measure_speed()
+
+				if speed > target_speed:
+					continue
+				else:
+					self.add_workers(1)
+			break
+
+	def measure_speed(self):
+		print('measuring speed...', end=' ')
+		tasks_done, elapsed_time = self.partial_run(SAMPLE_SIZE)
+		speed = tasks_done / elapsed_time if elapsed_time else float('inf')
+		print(f'measured speed = {speed}')
+		return speed
