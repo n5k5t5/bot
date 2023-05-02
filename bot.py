@@ -201,7 +201,7 @@ class TimelyPool(Pool):
 
 	def run(self, num_workers=1, speed_adj=100):
 		self.start_time = time()
-		self.sample_size = self.original_load // speed_adj
+		self.sample_size = (self.original_load // speed_adj) if speed_adj else self.original_load
 
 		self.add_workers(num_workers)
 		if speed_adj:
@@ -277,4 +277,3 @@ class TimelyPool(Pool):
 		speed = tasks_done / elapsed_time if elapsed_time else float('inf')
 		print(f'measured speed = {speed}')
 		return speed
-	
