@@ -7,9 +7,10 @@ import pickle
 from collections import deque
 from subprocess import Popen, PIPE
 from threading import Thread, Event
-from time import time
 from queue import Queue
-from math import ceil
+from time import time
+
+from math import ceil, isnan
 
 
 HEADERSIZE = 64
@@ -17,6 +18,9 @@ BYTE_ORDER = 'little'
 PREP = 'prep'
 QUERY = 'query'
 MAX_WORKERS = 100
+
+class Done(Exception):
+	pass
 
 
 def encode_msg(msg):
@@ -199,19 +203,16 @@ class TimelyPool(Pool):
 				self.sleeping_workers.append(worker)
 		print(f'num workers = {len(self.active_workers)}')
 
+	def set_workers(self, num_workers):
+		self.add_workers(num_workers - len(self.active_workers))
+
 	def run(self, num_workers=1, speed_adj=100):
 		self.start_time = time()
 		self.sample_size = (self.original_load // speed_adj) if speed_adj else self.original_load
 
 		self.add_workers(num_workers)
 		if speed_adj:
-			i = 1
-			curr_speed = None
-			while len(self.tasks):
-				self.adjust_speed(curr_speed)
-				print(f'doing run # {i}...')
-				curr_speed = self.measure_speed()
-				i += 1
+			self.adjust_speed()
 
 		while len(self.results) < self.original_load:
 			self.results.append(self.out_queue.get())
@@ -244,36 +245,27 @@ class TimelyPool(Pool):
 		target_speed = tasks_remain / time_remains if tasks_remain else None
 		print(f'target speed = {target_speed}')
 		return target_speed
-	
-	def adjust_speed(self, curr_speed=None):
-		speed = curr_speed or self.measure_speed()
-		target_speed = self.target_speed()
-		while len(self.active_workers) < MAX_WORKERS:
-			if not target_speed:
-				return
-			if speed < target_speed:
-				num_workers = len(self.active_workers)
-				extra_workers = (ceil(target_speed * 1.1 / speed * num_workers) - num_workers) or 1
-				extra_workers = min(extra_workers, MAX_WORKERS - num_workers)
-				self.add_workers(extra_workers)
-				new_speed = self.measure_speed()
-				if new_speed < speed:
-					self.add_workers(-extra_workers)
-				else:
-					speed = new_speed
-					continue
-			elif speed > 1.5 * target_speed and len(self.active_workers) > 1:
-				self.add_workers(-1)
-				speed = self.measure_speed()
 
-				if speed > target_speed:
-					continue
-				else:
-					self.add_workers(1)
-			break
+	def adjust_speed(self):
+		while self.tasks:
+			try:
+				target_speed = self.target_speed()
+				if not target_speed:
+					break
+				num_workers = len(self.active_workers)
+				speeds = {}
+				for new_num_workers in range(max(1, num_workers-1), min(num_workers + 1, MAX_WORKERS)):
+					self.set_workers(new_num_workers)
+					speeds[new_num_workers] = self.measure_speed()
+				optimum = min(speeds, key=lambda x: abs(speeds[x] - target_speed))
+				self.set_workers(optimum)
+			except Done:
+				pass
 
 	def measure_speed(self):
 		tasks_done, elapsed_time = self.partial_run(self.sample_size)
+		if not tasks_done:
+			raise Done
 		speed = tasks_done / elapsed_time if elapsed_time else float('inf')
 		print(f'measured speed = {speed}')
 		return speed
