@@ -7,19 +7,17 @@ import pickle
 from collections import deque
 from subprocess import Popen, PIPE
 from threading import Thread, Event
-from time import sleep, time
-from queue import Queue, Empty
+from time import time
+from queue import Queue
+from math import ceil
+
 
 HEADERSIZE = 64
 BYTE_ORDER = 'little'
 PREP = 'prep'
 QUERY = 'query'
-BYE = 'bye'
-TASK_READY = 'task_ready'
-CLOSING = 'closing'
-READY = 'ready'
-SAMPLE_SIZE = 100
 MAX_WORKERS = 100
+
 
 def encode_msg(msg):
 	raw_msg = pickle.dumps(msg)
@@ -183,8 +181,7 @@ class TimelyPool(Pool):
 		self.active_workers = []
 		self.sleeping_workers = []
 		self.original_load = len(self.tasks)	
-		global SAMPLE_SIZE
-		SAMPLE_SIZE = len(tasks) // 100
+		
 	def add_workers(self, deficit):
 		if deficit > 0:
 			to_awaken = min(deficit, len(self.sleeping_workers))
@@ -202,17 +199,18 @@ class TimelyPool(Pool):
 				self.sleeping_workers.append(worker)
 		print(f'num workers = {len(self.active_workers)}')
 
-	def run(self, num_workers=1, speed_adj=10):
+	def run(self, num_workers=1, speed_adj=100):
 		self.start_time = time()
-		# self.add_workers(100)		
-		# self.add_workers(num_workers - 100)
+		self.sample_size = self.original_load // speed_adj
+
 		self.add_workers(num_workers)
 		if speed_adj:
 			i = 1
+			curr_speed = None
 			while len(self.tasks):
-				self.adjust_speed()
-				print(f'doing a prod run # {i}...')
-				self.partial_run(self.original_load // speed_adj)
+				self.adjust_speed(curr_speed)
+				print(f'doing run # {i}...')
+				curr_speed = self.measure_speed()
 				i += 1
 
 		while len(self.results) < self.original_load:
@@ -238,9 +236,7 @@ class TimelyPool(Pool):
 				self.results.append(self.out_queue.get())
 			elapsed_time = time() - start_time
 			speed = tasks_to_do / elapsed_time if elapsed_time else float("inf")
-			print(f'speed = {speed}, elapsed = {elapsed_time}')
 		return tasks_to_do, elapsed_time
-
 
 	def target_speed(self):
 		time_remains = max(self.tta - time(), 1)
@@ -249,18 +245,20 @@ class TimelyPool(Pool):
 		print(f'target speed = {target_speed}')
 		return target_speed
 	
-	def adjust_speed(self):
-		print('adjusting speed...')
+	def adjust_speed(self, curr_speed=None):
+		speed = curr_speed or self.measure_speed()
 		target_speed = self.target_speed()
-		speed = self.measure_speed()
 		while len(self.active_workers) < MAX_WORKERS:
 			if not target_speed:
 				return
 			if speed < target_speed:
-				self.add_workers(1)
+				num_workers = len(self.active_workers)
+				extra_workers = (ceil(target_speed * 1.1 / speed * num_workers) - num_workers) or 1
+				extra_workers = min(extra_workers, MAX_WORKERS - num_workers)
+				self.add_workers(extra_workers)
 				new_speed = self.measure_speed()
 				if new_speed < speed:
-					self.add_workers(-1)
+					self.add_workers(-extra_workers)
 				else:
 					speed = new_speed
 					continue
@@ -275,8 +273,8 @@ class TimelyPool(Pool):
 			break
 
 	def measure_speed(self):
-		print('measuring speed...', end=' ')
-		tasks_done, elapsed_time = self.partial_run(SAMPLE_SIZE)
+		tasks_done, elapsed_time = self.partial_run(self.sample_size)
 		speed = tasks_done / elapsed_time if elapsed_time else float('inf')
 		print(f'measured speed = {speed}')
 		return speed
+	
