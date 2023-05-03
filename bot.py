@@ -1,5 +1,5 @@
 '''
-Python package for running workers
+Python package for running interactive workers
 '''
 from sys import stdin, stdout
 import os
