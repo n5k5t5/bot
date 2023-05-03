@@ -10,14 +10,13 @@ from threading import Thread, Event
 from queue import Queue
 from time import time
 
-from math import ceil, isnan
-
 
 HEADERSIZE = 64
 BYTE_ORDER = 'little'
 PREP = 'prep'
 QUERY = 'query'
 MAX_WORKERS = 100
+
 
 class Done(Exception):
 	pass
@@ -178,14 +177,18 @@ class Pool:
 
 
 class TimelyPool(Pool):
-	def __init__(self, command, tasks, setup=None, logstream=None, tta=None):
+	def __init__(self, command, tasks, setup=None, logstream=None):
 		super().__init__(command, tasks, setup=setup, logstream=logstream)
-		self.tta = tta
-		self.results = deque()
+		self.results = Queue()
 		self.active_workers = []
 		self.sleeping_workers = []
 		self.original_load = len(self.tasks)	
-		
+		self.result_count = 0
+
+	def get_result(self, block=True):
+		self.results.put(self.out_queue.get(block=block))
+		self.result_count += 1
+
 	def add_workers(self, deficit):
 		if deficit > 0:
 			to_awaken = min(deficit, len(self.sleeping_workers))
@@ -206,55 +209,30 @@ class TimelyPool(Pool):
 	def set_workers(self, num_workers):
 		self.add_workers(num_workers - len(self.active_workers))
 
-	def run(self, num_workers=1, speed_adj=100):
+	def run(self, num_workers=1, tta=None, speed_adj=100):
 		self.start_time = time()
+		self.tta = tta
 		self.sample_size = (self.original_load // speed_adj) if speed_adj else self.original_load
 
 		self.add_workers(num_workers)
-		if speed_adj:
+		if speed_adj and tta:
 			self.adjust_speed()
-
-		while len(self.results) < self.original_load:
-			self.results.append(self.out_queue.get())
-
+		while self.result_count < self.original_load:
+			self.get_result()
 		print(f'target runtime {self.tta - self.start_time}, actual: {time() - self.start_time}')
-
-	@staticmethod
-	def flush_queue(source: Queue, target: list):
-		while True:
-			try:
-				target.append(source.get_nowait())
-			except:
-				break
-
-	def partial_run(self, num_tasks):
-		TimelyPool.flush_queue(self.out_queue, self.results)
-		tasks_to_do = min(num_tasks, self.original_load - len(self.results))
-		elapsed_time  = 0
-		if tasks_to_do:
-			start_time = time()
-			for _ in range(tasks_to_do):
-				self.results.append(self.out_queue.get())
-			elapsed_time = time() - start_time
-			speed = tasks_to_do / elapsed_time if elapsed_time else float("inf")
-		return tasks_to_do, elapsed_time
-
-	def target_speed(self):
-		time_remains = max(self.tta - time(), 1)
-		tasks_remain = self.original_load - self.out_queue.qsize()
-		target_speed = tasks_remain / time_remains if tasks_remain else None
-		print(f'target speed = {target_speed}')
-		return target_speed
 
 	def adjust_speed(self):
 		while self.tasks:
 			try:
-				target_speed = self.target_speed()
+				target_speed = self.compute_target_speed()
 				if not target_speed:
 					break
 				num_workers = len(self.active_workers)
+				# to prevent a potential bias: any slowdown from addition of a worker will
+				# propagate to the -1 case at least as much as to +1.
+				self.add_workers(1)
 				speeds = {}
-				for new_num_workers in range(max(1, num_workers-1), min(num_workers + 1, MAX_WORKERS)):
+				for new_num_workers in range(max(1, num_workers-1), min(num_workers + 1, MAX_WORKERS) + 1):
 					self.set_workers(new_num_workers)
 					speeds[new_num_workers] = self.measure_speed()
 				optimum = min(speeds, key=lambda x: abs(speeds[x] - target_speed))
@@ -269,3 +247,41 @@ class TimelyPool(Pool):
 		speed = tasks_done / elapsed_time if elapsed_time else float('inf')
 		print(f'measured speed = {speed}')
 		return speed
+	
+	def start(self, *args, **kwargs):
+		Thread(target=self.run, args=args, kwargs=kwargs).start()
+		return self
+	
+	def result_generator(self):
+		for _ in range(self.original_load):
+			yield self.results.get()
+
+	def is_done(self):
+		return self.result_count == self.original_load
+	
+	def flush_results(self):
+		while True:
+			try:
+				self.get_result(block=False)
+			except:
+				break
+
+	def partial_run(self, num_tasks=float('inf')):
+		self.flush_results()
+		tasks_to_do = min(num_tasks, self.original_load - self.result_count)
+		elapsed_time  = 0
+		if tasks_to_do:
+			start_time = time()
+			for _ in range(tasks_to_do):
+				self.get_result()
+			elapsed_time = time() - start_time
+			speed = tasks_to_do / elapsed_time if elapsed_time else float("inf")
+		return tasks_to_do, elapsed_time
+
+	def compute_target_speed(self):
+		time_remains = max(self.tta - time(), 1)
+		tasks_remain = self.original_load - self.out_queue.qsize()
+		target_speed = tasks_remain / time_remains if tasks_remain else None
+		print(f'target speed = {target_speed}')
+		return target_speed
+	
