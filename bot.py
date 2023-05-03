@@ -185,7 +185,7 @@ class TimelyPool(Pool):
 		self.original_load = len(self.tasks)	
 		self.result_count = 0
 
-	def get_result(self, block=True):
+	def _fetch_result(self, block=True):
 		self.results.put(self.out_queue.get(block=block))
 		self.result_count += 1
 
@@ -218,7 +218,7 @@ class TimelyPool(Pool):
 		if speed_adj and tta:
 			self.adjust_speed()
 		while self.result_count < self.original_load:
-			self.get_result()
+			self._fetch_result()
 		print(f'target runtime {self.tta - self.start_time}, actual: {time() - self.start_time}')
 
 	def adjust_speed(self):
@@ -253,8 +253,20 @@ class TimelyPool(Pool):
 		return self
 	
 	def result_generator(self):
+		'''
+		Get results in the order they arrived, each in the form ((task_index, result), timestamp)
+		'''
 		for _ in range(self.original_load):
 			yield self.results.get()
+
+	def get_results(self):
+		'''
+		Get results in a list with 1-1 correspondence to the tasks
+		'''
+		results = [None] * self.original_load
+		for (i, result), _ in self.result_generator():
+			results[i] = result
+		return results
 
 	def is_done(self):
 		return self.result_count == self.original_load
@@ -262,7 +274,7 @@ class TimelyPool(Pool):
 	def flush_results(self):
 		while True:
 			try:
-				self.get_result(block=False)
+				self._fetch_result(block=False)
 			except:
 				break
 
@@ -273,7 +285,7 @@ class TimelyPool(Pool):
 		if tasks_to_do:
 			start_time = time()
 			for _ in range(tasks_to_do):
-				self.get_result()
+				self._fetch_result()
 			elapsed_time = time() - start_time
 			speed = tasks_to_do / elapsed_time if elapsed_time else float("inf")
 		return tasks_to_do, elapsed_time
@@ -284,4 +296,3 @@ class TimelyPool(Pool):
 		target_speed = tasks_remain / time_remains if tasks_remain else None
 		print(f'target speed = {target_speed}')
 		return target_speed
-	
