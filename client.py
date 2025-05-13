@@ -1,4 +1,3 @@
-from random import sample
 import os
 from subprocess import Popen
 from threading import Thread, Event, Lock, Condition
@@ -8,8 +7,8 @@ from datetime import datetime
 import logging
 from math import ceil
 import random
-from collections import deque
 import socket
+import selectors
 from workerpool import common as bp
 
 
@@ -23,7 +22,6 @@ SANE_WORKERS = os.cpu_count() or 12
 MAX_WORKERS = max(25, (3 * SANE_WORKERS) // 2)
 SPEED_ADJ = 100
 MIN_TIME_STEP = 5
-DONE_SENTINEL = 'DONE'
 
 
 logging.getLogger().setLevel(logging.INFO)
@@ -68,10 +66,10 @@ class Socket():
 
     def send_msg(self, data):
         return bp.send_msg(data, self.out_stream)
-
+    
     def read_msg(self):
         return bp.read_msg(self.in_stream)
-
+    
     def initialize(self, init_data):
         self.send_msg([bp.INIT_DATA, init_data])
         logging.debug(f'Sent init data')
@@ -102,14 +100,15 @@ class Socket():
         assert success
         kind, ret_data = msg
         return ret_data
-
+        
     def do_task(self, data):
         '''
         Submits task to the worker and returns the result.
         :param data: [index, content]
         '''
         self.send_task(data)
-        return self.get_task_result()
+        res =  self.get_task_result()
+        return res
 
 
 class Worker(Socket):
@@ -159,7 +158,12 @@ class Node:
         self.rsucc = None
         self.seen = False
 
+
 class RequestorQueue:
+    '''
+    Get and the next in line from a specific category or, if none available, just the next in line.
+    Delete elements in O(1) time.
+    '''
     def __init__(self):
         self.rheads = {}
         self.head = None
@@ -259,8 +263,9 @@ class Sprint:
         self.ind_lookup = {} if with_inds else None
         self.requestors = {}
         self.log = Queue()
+        self.recycle = False
         self.recycled = set() # for logging only
-
+        self.chunksize = 1
     def submit_tasks(self, tasks, requestor='') -> int:
         '''
         Submit an ask for execution
@@ -300,7 +305,7 @@ class Sprint:
                         # new task, update records
                         self.in_progress[idx] = node
                         node.seen = True
-                    if not self.open:
+                    if self.recycle:
                         self.tasks.append(node) # let another worker pick it up...
                         self.recycled.add(idx)
                     else:
@@ -329,37 +334,6 @@ class Sprint:
             self.log.put([ind, time_now, worker_name])
             if not self.open and self.num_submitted_tasks == self.result_count:
                 self.is_done_event.set()
-
-    # def get_result(self, requestor=''):
-    #     if requestor not in self.nums_picked_res:
-    #         self.nums_picked_res[requestor] = 0
-    #     out_queue = self.out_queues.setdefault(requestor, Queue())
-    #     while True:
-    #         with self.mutex:
-    #             if self.nums_picked_res[requestor] == self.nums_submitted_tasks[requestor]:
-    #                 if self.open:
-    #                     self.not_empty.wait()
-    #                     continue
-    #                 else:
-    #                     raise StopIteration
-    #         resp = out_queue.get()
-    #         idx = resp[0]
-    #         res = resp if self.ind_lookup is None else (self.ind_lookup[idx], resp[1])
-    #         if self.ind_lookup is not None:
-    #             self.ind_lookup.pop(resp[0])
-    #         self.requestors.pop(resp[0])
-    #         self.nums_picked_res[requestor] += 1
-    #         return res
-
-    # def yield_results(self, requestor=''):
-    #     '''
-    #     :param requestor: the  name of the requestor
-    #     '''
-    #     while True:
-    #         try:
-    #             yield self.get_result(requestor=requestor)
-    #         except StopIteration:
-    #             return
 
     def yield_results(self, requestor=''):
         '''
@@ -408,11 +382,12 @@ class Sprint:
 
         if self.open:
             self.open = False
-            self.flush()
+            self.start_recycle()
 
-    def flush(self):
+    def start_recycle(self):
         count = 0
         with self.mutex:
+            self.recycle = True
             for idx, node in self.in_progress.items():
                 if node not in self.tasks:
                     self.tasks.append(node)
@@ -482,6 +457,21 @@ class Batch(Sprint):
         self.submit_tasks(tasks)
         self.close()
 
+
+class Swarm:
+   def __init__(self, command, num_workers=None, task_processor=None, initializer=None):
+        if num_workers is None:
+            num_workers = SANE_WORKERS
+        self.command = command
+        logging.info(f'Worker command: {self.command}')
+        self.workers = [] # it is useful to retain the order in which workers were created...
+        if task_processor:
+            self.house_worker = SprintMan(bp.HouseWorker(task_processor, initializer=initializer))
+            self.house_worker.thread.start()
+        else:
+            self.house_worker = None
+        self.add_workers(num_workers)
+        self.sprint_to_workers = dict()
 
 class Pool:
     '''
@@ -571,6 +561,26 @@ class Pool:
         self.close()
 
 
+def print_contributions(pool, batch, contributions):
+    is_done = batch.is_done()
+    while not batch.log.empty():
+        worker_name = batch.log.get()[2]
+        contributions[worker_name] = contributions.get(worker_name, 0) + 1
+    logging.info('Worker Contributions by task counts and percent:')
+    worker_stati = {pool.house_worker.actual.name: None} if pool.house_worker else {}
+    for worker in pool.workers:
+        worker_stati[worker.actual.name] = worker.actual.status
+
+    for worker_name, status in worker_stati.items():
+        contribution = contributions.get(worker_name, 0)
+        if is_done:
+            logging.info(f'Worker: {worker_name}, status: {status}, contrib: {contribution}, {round(contribution / batch.num_submitted_tasks * 100, 1)}%')
+        else:
+            logging.info(f'Worker: {worker_name}, status: {status}, contrib: {contribution}')
+    if is_done:
+        logging.info(f'Total contributions = {sum(contributions.values())}, total tasks = {batch.num_submitted_tasks}')
+
+
 class BatchManager:
     '''
     This class deploys new workers if and when calculation runs late.
@@ -648,33 +658,13 @@ class BatchManager:
                 self.speed_adjustment(gradual=False)
             batch.is_done_event.wait()
             logging.info(f'Done.  Target time of completion: {datetime.fromtimestamp(self.tta) if self.tta else None}.')
-            self.print_contributions()
+            print_contributions(self.pool, self.batch, self.contributions)
         finally:
             logging.info('batch_manager thread exited')
 
     def start(self, *args, **kwargs):
         self.main_thread = Thread(target=self.batch_manager, args=args, kwargs=kwargs, daemon=True)
         self.main_thread.start()
-
-    def print_contributions(self):
-        batch = self.batch
-        is_done = batch.is_done()
-        while not batch.log.empty():
-            worker_name = batch.log.get()[2]
-            self.contributions[worker_name] = self.contributions.get(worker_name, 0) + 1
-        logging.info('Worker Contributions by task counts and percent:')
-        worker_stati = {self.pool.house_worker.actual.name: None} if self.pool.house_worker else {}
-        for worker in self.pool.workers:
-            worker_stati[worker.actual.name] = worker.actual.status
-
-        for worker_name, status in worker_stati.items():
-            contribution = self.contributions.get(worker_name, 0)
-            if is_done:
-                logging.info(f'Worker: {worker_name}, status: {status}, contrib: {contribution}, {round(contribution / batch.num_submitted_tasks * 100, 1)}%')
-            else:
-                logging.info(f'Worker: {worker_name}, status: {status}, contrib: {contribution}')
-        if is_done:
-            logging.info(f'Total contributions = {sum(self.contributions.values())}, total tasks = {batch.num_submitted_tasks}')
 
     def speed_adjustment(self, gradual=True):
         full_throttle = False
@@ -727,6 +717,3 @@ class BatchManager:
     def close(self):
         if self.main_thread:
             self.main_thread.join()
-
-
-
