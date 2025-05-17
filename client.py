@@ -4,12 +4,11 @@ from threading import Thread, Event, Lock, Condition
 from queue import Queue
 from time import time, sleep
 from datetime import datetime
-import logging
 from math import ceil
 import random
 import socket
-import selectors
-from workerpool import common as bp
+import traceback
+import common as cm
 
 
 MAIN_PROCESS = f'PID {os.getpid()}'
@@ -24,9 +23,6 @@ SPEED_ADJ = 100
 MIN_TIME_STEP = 5
 
 
-logging.getLogger().setLevel(logging.INFO)
-
-
 min_sec = lambda sec: f'{sec // 60 :.0f} min {sec % 60 :.0f} s'
 
 
@@ -37,7 +33,7 @@ def get_socket(socket_file):
     return s, sf
 
 
-class Socket():
+class Socket(cm.AbstractWorker):
     def __init__(self, pid, suffix=''):
         '''
         A client socket for connecting to an existing worker
@@ -47,7 +43,7 @@ class Socket():
         self.name = f'pid {self.pid}'
         self.in_stream = None
         self.out_stream = None
-        self.socket_file = bp.SOCKET_FILE.format(pid=self.pid, suffix=suffix)
+        self.socket_file = cm.SOCKET_FILE.format(pid=self.pid, suffix=suffix)
         self.status = INSTANTIATED
 
     def attempt_connect(self):
@@ -64,28 +60,35 @@ class Socket():
                 sleep(1)
         self.status = CONNECTED
 
-    def send_msg(self, data):
-        return bp.send_msg(data, self.out_stream)
+    def send_msg(self, raw_msg: bytes):
+        return cm.send_msg(raw_msg, self.out_stream)
     
-    def read_msg(self):
-        return bp.read_msg(self.in_stream)
+    def read_msg(self) -> bytes:
+        return cm.read_msg(self.in_stream)
+    
+    def execute(self, msg: bytes) -> bytes:
+        self.send_msg(msg)
+        return self.read_msg()
     
     def initialize(self, init_data):
-        self.send_msg([bp.INIT_DATA, init_data])
-        logging.debug(f'Sent init data')
+        raw_idx = cm.encode_int(0)
+        msg = cm.compose_msg(cm.INIT_DATA, raw_idx, cm.dumpb(init_data))
+        self.send_msg(msg)
+        logger.debug(f'Sent init data')
         msg, success = self.read_msg()
-        logging.debug('Received init response')
+        logger.debug('Received init response')
         if success:
-            if msg == [bp.INIT_DATA, True]:
+            target, ret_raw_idx, _ = cm.decompose_msg(msg)
+            if target == cm.INIT_DATA and ret_raw_idx == raw_idx:
                 self.status = READY_FOR_TASKS
-                logging.info(f'{self.name} is ready for tasks')
+                logger.info(f'{self.name} is ready for tasks')
                 return True
             else:
-                logging.error(f'{self.name} failed to set up')
-                logging.error(f'{self.name} init response:  {msg}')
+                logger.error(f'{self.name} failed to set up')
+                logger.error(f'{self.name} init response:  {msg}')
                 return False
         else:
-            logging.info(f'{self.name} is dead')
+            logger.info(f'{self.name} is dead')
             return
     
     def send_task(self, data):
@@ -93,13 +96,13 @@ class Socket():
         Sumbits task to the worker
         :param data: [index, content]
         '''
-        self.send_msg([bp.TASK, data])
+        self.send_msg(cm.compose_msg(cm.TASK, cm.encode_int(data[0]), cm.dumpb(data[1])))
 
     def get_task_result(self):
         msg, success = self.read_msg()
         assert success
-        kind, ret_data = msg
-        return ret_data
+        _, raw_idx, res = cm.decompose_msg(msg)
+        return cm.decode_int(raw_idx), cm.loadb(res)
         
     def do_task(self, data):
         '''
@@ -107,19 +110,25 @@ class Socket():
         :param data: [index, content]
         '''
         self.send_task(data)
-        res =  self.get_task_result()
-        return res
+        return self.get_task_result()
+
+    def has_quit(self):
+        try:
+            os.kill(int(self.pid), 0)
+            return True
+        except OSError:
+            return False
 
 
 class Worker(Socket):
     '''
     A socket which results after starting a process by a given command.
     '''
-    def __init__(self, command):
+    def __init__(self, command, suffix=''):
         self.command = command
         self.process = Popen(command)
-        super().__init__(self.process.pid)
-        logging.info(f'Worker launched, command: {command}, '
+        super().__init__(self.process.pid, suffix=suffix)
+        logger.info(f'Worker launched, command: {command}, '
             f"id = {self.process.pid}, socket file: {self.socket_file}")
 
     def initialize(self, init_data):
@@ -133,15 +142,15 @@ class Worker(Socket):
         return self.process.poll() is not None
     
     def kill(self):
-        logging.info(f'Removing socket file {self.socket_file}')
+        logger.info(f'Removing socket file {self.socket_file}')
         try:
             os.unlink(self.socket_file)
-            logging.info(f'Removed {self.socket_file}')
+            logger.info(f'Removed {self.socket_file}')
         except:
             pass
-        logging.info(f'Killing process {self.process.pid}')
+        logger.info(f'Killing process {self.process.pid}')
         self.process.kill()
-        logging.info(f'Killed {self.process.pid}.')
+        logger.info(f'Killed {self.process.pid}.')
 
 
 class Empty(Exception):
@@ -266,6 +275,7 @@ class Sprint:
         self.recycle = False
         self.recycled = set() # for logging only
         self.chunksize = 1
+
     def submit_tasks(self, tasks, requestor='') -> int:
         '''
         Submit an ask for execution
@@ -343,7 +353,7 @@ class Sprint:
         if requestor not in self.nums_picked_res:
             self.nums_picked_res[requestor] = 0
         out_queue = self.out_queues.setdefault(requestor, Queue())
-        logging.debug(f'started iterating over results submitted by "{requestor}"...')
+        logger.debug(f'started iterating over results submitted by "{requestor}"...')
         while self.nums_picked_res[requestor] < self.nums_submitted_tasks[requestor]:
             resp = out_queue.get()
             idx = resp[0]
@@ -410,7 +420,8 @@ class SprintMan:
 
     def work_on_sprint(self):
         sprint = self.sprint_status[0]
-        assert self.actual.initialize(sprint.init_data)
+        if sprint.init_data is not None:
+            self.actual.initialize(sprint.init_data)
         self.sprint_status = (sprint, READY_FOR_TASKS)
         while True:
             if self.stop_order:
@@ -421,17 +432,17 @@ class SprintMan:
             except Empty:
                 break
             try:
-                ind = task[0]
-                ret_ind, res = self.actual.do_task(task)
-                assert ind == ret_ind
+                idx = task[0]
+                ret_idx, res = self.actual.do_task(task)
+                assert ret_idx == idx
             except Exception as error:
-                logging.warning(f'{self.actual.name} failed to process task # {ind}')
-                logging.warning(f'with error: {error}')
+                logger.warning(f'{self.actual.name} failed to process task # {idx}')
+                logger.warning(f'with error: {error}')
                 if self.actual.has_quit():
-                    logging.info(f'{self.actual.name} has quit')
+                    logger.info(f'{self.actual.name} has quit')
                     return                  
             else:
-                sprint.submit_result(ind, res, self.actual.name)
+                sprint.submit_result(idx, res, self.actual.name)
 
     def worker_loop(self):
         self.actual.connect()
@@ -443,8 +454,8 @@ class SprintMan:
             self.sprint_status = (sprint, CONNECTED)
             try:
                 self.work_on_sprint()
-            except Exception as error:
-                logging.error(error)
+            except Exception:
+                logger.error(traceback.format_exc())
                 return
 
 
@@ -458,33 +469,26 @@ class Batch(Sprint):
         self.close()
 
 
-class Swarm:
-   def __init__(self, command, num_workers=None, task_processor=None, initializer=None):
-        if num_workers is None:
-            num_workers = SANE_WORKERS
-        self.command = command
-        logging.info(f'Worker command: {self.command}')
-        self.workers = [] # it is useful to retain the order in which workers were created...
-        if task_processor:
-            self.house_worker = SprintMan(bp.HouseWorker(task_processor, initializer=initializer))
-            self.house_worker.thread.start()
-        else:
-            self.house_worker = None
-        self.add_workers(num_workers)
-        self.sprint_to_workers = dict()
-
 class Pool:
     '''
     A pool of workers
     '''
-    def __init__(self, command, num_workers=None, task_processor=None, initializer=None):
+    def __init__(self, command, num_workers=None, task_processor=None, initializer=None, calls={}, suffix=''):
+        # backward compatibility, want to only use calls
+        if not calls:  
+            calls = {
+                cm.TASK: task_processor,
+                # init data will arrive as a tuple
+                cm.INIT_DATA: lambda x: initializer(*x)  
+                }
+        self.suffix = suffix
         if num_workers is None:
             num_workers = SANE_WORKERS
         self.command = command
-        logging.info(f'Worker command: {self.command}')
+        logger.info(f'Worker command: {self.command}')
         self.workers = [] # it is useful to retain the order in which workers were created...
         if task_processor:
-            self.house_worker = SprintMan(bp.HouseWorker(task_processor, initializer=initializer))
+            self.house_worker = SprintMan(cm.HouseWorker(calls))
             self.house_worker.thread.start()
         else:
             self.house_worker = None
@@ -501,14 +505,14 @@ class Pool:
         while len(added_workers) < num_workers:
             command = self.command
             try:
-                worker = SprintMan(Worker(command))
-            except Exception as error:
-                logging.warning(f'Failed to launch a worker.  Command: {command}')
-                logging.error(error)
+                worker = SprintMan(Worker(command, suffix=self.suffix))
+            except Exception:
+                logger.warning(f'Failed to launch a worker.  Command: {command}')
+                logger.error(traceback.format_exc())
                 continue      
             worker.thread.start()        
             self.workers.append(worker)
-            logging.info(f'Appended worker {worker.actual.name} to the worker list')
+            logger.info(f'Appended worker {worker.actual.name} to the worker list')
             added_workers.add(worker)      
         return added_workers
     
@@ -552,7 +556,7 @@ class Pool:
     def close(self):
         for w in self.workers:
             w.actual.kill()
-        logging.info('Worker Pool is closed')          
+        logger.info('Worker Pool is closed')          
 
     def __enter__(self):
         return self
@@ -566,7 +570,7 @@ def print_contributions(pool, batch, contributions):
     while not batch.log.empty():
         worker_name = batch.log.get()[2]
         contributions[worker_name] = contributions.get(worker_name, 0) + 1
-    logging.info('Worker Contributions by task counts and percent:')
+    logger.info('Worker Contributions by task counts and percent:')
     worker_stati = {pool.house_worker.actual.name: None} if pool.house_worker else {}
     for worker in pool.workers:
         worker_stati[worker.actual.name] = worker.actual.status
@@ -574,11 +578,11 @@ def print_contributions(pool, batch, contributions):
     for worker_name, status in worker_stati.items():
         contribution = contributions.get(worker_name, 0)
         if is_done:
-            logging.info(f'Worker: {worker_name}, status: {status}, contrib: {contribution}, {round(contribution / batch.num_submitted_tasks * 100, 1)}%')
+            logger.info(f'Worker: {worker_name}, status: {status}, contrib: {contribution}, {round(contribution / batch.num_submitted_tasks * 100, 1)}%')
         else:
-            logging.info(f'Worker: {worker_name}, status: {status}, contrib: {contribution}')
+            logger.info(f'Worker: {worker_name}, status: {status}, contrib: {contribution}')
     if is_done:
-        logging.info(f'Total contributions = {sum(contributions.values())}, total tasks = {batch.num_submitted_tasks}')
+        logger.info(f'Total contributions = {sum(contributions.values())}, total tasks = {batch.num_submitted_tasks}')
 
 
 class BatchManager:
@@ -604,7 +608,7 @@ class BatchManager:
         delays_str = f'{exp_delay / 60 :.2f} / {overall_exp_delay / 60:.2f} min'
         eta_str = min_sec(tasks_remain / speed)
         arrival_update = f'(Current/Avg/Desired) speeds: {speed_} / {avg_speed_} / {desired_speed_}, delays: {delays_str}, remains {tasks_remain} / {num_submitted_tasks}, should be finished in {eta_str}'
-        logging.info(arrival_update)
+        logger.info(arrival_update)
 
     def __init__(self, pool, asks, init_data=None):
         self.active_workers = set()
@@ -630,13 +634,13 @@ class BatchManager:
  
     def set_workers(self, num_workers):
         self.survey_workers()
-        logging.info(f'Workers: current total: {len(self.pool.workers)}, active: {len(self.active_workers)}, pending: {len(self.pending_workers)}, '
+        logger.info(f'Workers: current total: {len(self.pool.workers)}, active: {len(self.active_workers)}, pending: {len(self.pending_workers)}, '
             f'desired: {num_workers}')
         num_workers_to_add = max(0, num_workers - len(self.active_workers) - len(self.pending_workers))
-        logging.info(f'Adding {num_workers_to_add} workers')
+        logger.info(f'Adding {num_workers_to_add} workers')
         self.pool.add_workers_to_sprint(num_workers_to_add, self.batch)
         self.survey_workers() # to update the sets accessed in the next line...  
-        logging.info(f'Workers: current total: {len(self.pool.workers)}, active: {len(self.active_workers)}, pending: {len(self.pending_workers)}')
+        logger.info(f'Workers: current total: {len(self.pool.workers)}, active: {len(self.active_workers)}, pending: {len(self.pending_workers)}')
 
     def batch_manager(self, num_workers=None, tasks_per_worker=None, tta=None, speed_adj=SPEED_ADJ):
         self.start_time, self.tta = time(), tta
@@ -647,20 +651,20 @@ class BatchManager:
                 return
             num_workers = num_workers or (batch.num_submitted_tasks // tasks_per_worker if tasks_per_worker else SANE_WORKERS)
             num_workers = BatchManager.trim_workers(num_workers)
-            logging.info(f'Starting with  {batch.num_submitted_tasks} tasks and {num_workers} workers.')
+            logger.info(f'Starting with  {batch.num_submitted_tasks} tasks and {num_workers} workers.')
             self.pool.submit_batch(batch, num_workers)
             if speed_adj and tta is not None:
-                logging.info(f'Target time of completion = {datetime.fromtimestamp(tta)}')
+                logger.info(f'Target time of completion = {datetime.fromtimestamp(tta)}')
                 speed_adj = min(speed_adj, len(batch.tasks))
                 self.time_step = (self.tta - self.start_time) // (speed_adj or 1)
                 self.time_step = max(self.time_step, MIN_TIME_STEP)
                 # Start a progress-monitoring thread...
                 self.speed_adjustment(gradual=False)
             batch.is_done_event.wait()
-            logging.info(f'Done.  Target time of completion: {datetime.fromtimestamp(self.tta) if self.tta else None}.')
+            logger.info(f'Done.  Target time of completion: {datetime.fromtimestamp(self.tta) if self.tta else None}.')
             print_contributions(self.pool, self.batch, self.contributions)
         finally:
-            logging.info('batch_manager thread exited')
+            logger.info('batch_manager thread exited')
 
     def start(self, *args, **kwargs):
         self.main_thread = Thread(target=self.batch_manager, args=args, kwargs=kwargs, daemon=True)
@@ -697,12 +701,12 @@ class BatchManager:
                 full_throttle = time_remains <= 0
                 if full_throttle:
                     desired_num_workers = BatchManager.trim_workers(num_active_workers + len(batch.tasks))
-                    logging.info(f'Missed the target, blasting full throttle...')
+                    logger.info(f'Missed the target, blasting full throttle...')
                     self.set_workers(desired_num_workers)
                 else:
                     if speed < desired_speed and avg_speed < desired_speed:
                         # it is time to get aggressive...
-                        logging.info('We need to speed up...')
+                        logger.info('We need to speed up...')
                         if gradual:
                             desired_num_workers = num_active_workers + 1 
                         else:
@@ -710,10 +714,13 @@ class BatchManager:
                             # ...to account for the house worker
                         desired_num_workers = BatchManager.trim_workers(desired_num_workers)
                         self.set_workers(desired_num_workers)
-            logging.info(f'Numbers of workers: currently active: {num_active_workers}, desired: {desired_num_workers}')
+            logger.info(f'Numbers of workers: currently active: {num_active_workers}, desired: {desired_num_workers}')
             prev_time = time_now
             prev_result_count = result_count
 
     def close(self):
         if self.main_thread:
             self.main_thread.join()
+
+
+logger = cm.Logger(__file__)
