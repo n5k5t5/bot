@@ -1,17 +1,11 @@
 import os
 import socket
-import logging
 from time import time
-from workerpool import common as bp
-import __main__
+import traceback
+import common as cm
 
 
-logging.getLogger().setLevel(logging.INFO)
-try:
-    rootname = os.path.splitext(os.path.basename(__main__.__file__))[0]
-except:
-    rootname = ''
-LOGFREQ = 20
+LOGFREQ = None
 
 
 # This loop is executed by the worker process...
@@ -21,18 +15,13 @@ def worker_loop(input, output, worker):
     while True:
         try:
             when_start = time()
-            msg, success = bp.read_msg(input)
+            msg, success = cm.read_msg(input)
             when_read = time()
             if not success:
                 return
-            kind, content = msg
-            if kind == bp.INIT_DATA:
-                worker.initialize(content)
-                response = True
-            elif kind == bp.TASK:
-                response = worker.do_task(content)
+            res = worker.execute(msg)
             when_calced = time()
-            bp.send_msg([kind, response], output)
+            cm.send_msg(res, output)
             when_done = time()
             total_time += when_done - when_start
             read_time += when_read - when_start
@@ -40,8 +29,8 @@ def worker_loop(input, output, worker):
             send_time += when_done - when_calced
             msg_size += success
             counter += 1
-            if counter % LOGFREQ == 0:
-                logging.info(f'{rootname}: size total read calc send (per call): '
+            if LOGFREQ and counter % LOGFREQ == 0:
+                logger.info(f'size total read calc send (per call): '
                     f'{msg_size / LOGFREQ} '
                     f'{total_time / LOGFREQ * 1000} ms '
                     f'{round(read_time / total_time * 100, 2)}% '
@@ -49,8 +38,8 @@ def worker_loop(input, output, worker):
                     f'{round(send_time / total_time * 100, 2)}% '
                     )
                 total_time = read_time = calc_time = send_time = msg_size = 0
-        except Exception as error:
-            logging.error(error)
+        except Exception:
+            logger.error(traceback.format_exc())
 
 
 def run_socket(loop, suffix=''):
@@ -58,7 +47,7 @@ def run_socket(loop, suffix=''):
     :param loop: a function taking two arguments: input: readable binary stream, output, writable binary stream
     :param suffix: suffix for forming socket name
     '''
-    socket_file = bp.SOCKET_FILE.format(pid=os.getpid(), suffix=suffix)
+    socket_file = cm.SOCKET_FILE.format(pid=os.getpid(), suffix=suffix)
     try:
         os.unlink(socket_file)
     except OSError:
@@ -70,28 +59,36 @@ def run_socket(loop, suffix=''):
         try:
             s.bind(socket_file)
             s.listen(1)
-            logging.info(f'Listening on file {socket_file}')
+            logger.info(f'Listening on file {socket_file}')
             while True:
                 conn, addr = s.accept()
                 with conn:
-                    logging.info(f'Connected by {addr}')
+                    logger.info(f'Connected by {addr}')
                     input = output = conn.makefile('rwb')
                     loop(input, output)
         except Exception as error:
-            logging.error(error)
+            logger.error(error)
         finally:
             os.unlink(socket_file)
 
 
 # Use this to create a task-processing server to be used as a worker...
-def run(worker=None, task_processor=None, initializer=None, suffix=''):
+def run(task_processor=None, initializer=None, suffix='', calls=None):
     '''
     :param worker: 
         example:
             worker.initialize(INIT_DATA)
             result = worker.do_task(task)
     '''
-    if not worker:
-        worker = bp.HouseWorker(task_processor, initializer=initializer)
+    # backward compatibiliy, want to only accept calls
+    if not calls:
+        calls = {
+            cm.TASK: task_processor,
+            cm.INIT_DATA: lambda x: initializer(*x)  
+            }
+    worker = cm.HouseWorker(calls)
     loop = lambda i, o: worker_loop(i, o, worker)
     run_socket(loop, suffix=suffix)
+
+
+logger = cm.Logger(__file__)
