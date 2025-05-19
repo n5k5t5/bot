@@ -1,5 +1,4 @@
 import os
-from abc import ABC
 from pickle import loads as loadb, dumps as dumpb
 from datetime import datetime
 import __main__
@@ -8,8 +7,6 @@ import __main__
 SOCKET_FILE = '/var/run/socket_{pid}_{suffix}'
 BYTE_ORDER = 'little'
 INTSIZE = 8
-INIT_DATA = b'initialize'
-TASK = b'do_task'
 
 
 encode_int = lambda x: int.to_bytes(x, INTSIZE, BYTE_ORDER)
@@ -33,14 +30,32 @@ def read_msg(in_stream):
     return raw_msg, INTSIZE + msg_size  # or just anything that has a boolean value of True
 
 
+def encode_iterable(args, msg=b''):
+    for arg in args:
+        msg += encode_int(len(arg)) + arg
+    return msg
+
+
+def decode_iterable(msg, i=0):
+    args = []
+    while i < len(msg):
+        j = i + 1 + decode_int(msg[i])
+        args.append(msg[i + 1: j])
+        i = j
+    return tuple(args)
+
+
 def decompose_msg(msg: bytes):
     target_len = decode_int(msg)
-    # target, raw_idx, arg
-    return msg[INTSIZE: INTSIZE + target_len], msg[INTSIZE + target_len: 2 * INTSIZE + target_len], msg[2 * INTSIZE + target_len:]
+    # target, raw_idx, args
+    return msg[INTSIZE: INTSIZE + target_len], msg[INTSIZE + target_len: 2 * INTSIZE + target_len], \
+        decode_iterable(msg, 2 * INTSIZE + target_len)
 
 
-def compose_msg(target: bytes, raw_idx: bytes, arg: bytes):
-    return encode_int(len(target)) + target + raw_idx + arg
+def compose_msg(target: bytes, raw_idx: bytes, args: bytes):
+    msg = encode_int(len(target)) + target + raw_idx
+    encode_iterable(args, msg)
+    return msg
 
 
 class Logger:
@@ -63,40 +78,6 @@ class Logger:
         def f(*args, **kwargs):
             return print(f'{self.root_name} {self.module_name} {datetime.now().strftime("%Y-%m-%d %H:%M:%S")} {os.getpid()} {mode}:',  *args, **kwargs)
         return f
- 
-
-class AbstractWorker(ABC):
-    def connect(self): ...
-
-    def initialize(self, init_data): ...
-    
-    def do_task(self, task): ...
-
-    def has_quit(self) -> bool: ...
-
-
-class HouseWorker(AbstractWorker):
-    def __init__(self, calls, name='House Worker'):
-        '''
-        :param task_processor: a function like object taking one argument and not taking exceptions
-        : param initializer: optional, for backwards
-        '''
-        self.calls = calls
-        self.name = name
-
-    def initialize(self, init_data):
-        return self.calls[INIT_DATA](init_data)
-        
-    def do_task(self, task):
-        return task[0], self.calls[TASK](task[1])
-    
-    def execute(self, msg):
-        target, raw_idx, arg = decompose_msg(msg)
-        func = self.calls[target]
-        return compose_msg(target, raw_idx, dumpb(func(loadb(arg))))
-
-    def has_quit(self):
-        return False
     
     
 logger = Logger(__file__)
