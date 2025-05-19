@@ -8,7 +8,8 @@ from math import ceil
 import random
 import socket
 import traceback
-import common as cm
+from abc import ABC
+from . import common as cm
 
 
 MAIN_PROCESS = f'PID {os.getpid()}'
@@ -21,6 +22,10 @@ SANE_WORKERS = os.cpu_count() or 12
 MAX_WORKERS = max(25, (3 * SANE_WORKERS) // 2)
 SPEED_ADJ = 100
 MIN_TIME_STEP = 5
+INIT = b'initialize'
+TASK = b'do_task'
+# True is for the old version
+SINGLETON_TASK = True
 
 
 min_sec = lambda sec: f'{sec // 60 :.0f} min {sec % 60 :.0f} s'
@@ -33,7 +38,38 @@ def get_socket(socket_file):
     return s, sf
 
 
-class Socket(cm.AbstractWorker):
+class AbstractWorker(ABC):
+    def connect(self): ...
+
+    def initialize(self, init_data): ...
+    
+    def do_task(self, task): ...
+
+    def has_quit(self) -> bool: ...
+
+
+class HouseWorker(AbstractWorker):
+    '''
+    Runs in the main client process.
+    '''
+    def __init__(self, calls, name='House Worker'):
+        '''
+        :param calls: {cm.INIT: callable, cm.TASK: callable, ...}
+        '''
+        self.calls = calls
+        self.name = name
+
+    def initialize(self, init_data):
+        return self.calls[cm.INIT](*init_data)
+        
+    def do_task(self, task):
+        return task[0], self.calls[cm.TASK](*task[1])
+
+    def has_quit(self):
+        return False
+
+
+class Socket(AbstractWorker):
     def __init__(self, pid, suffix=''):
         '''
         A client socket for connecting to an existing worker
@@ -72,14 +108,14 @@ class Socket(cm.AbstractWorker):
     
     def initialize(self, init_data):
         raw_idx = cm.encode_int(0)
-        msg = cm.compose_msg(cm.INIT_DATA, raw_idx, cm.dumpb(init_data))
+        msg = cm.compose_msg(cm.INIT, raw_idx, map(cm.dumpb, init_data))
         self.send_msg(msg)
         logger.debug(f'Sent init data')
         msg, success = self.read_msg()
         logger.debug('Received init response')
         if success:
             target, ret_raw_idx, _ = cm.decompose_msg(msg)
-            if target == cm.INIT_DATA and ret_raw_idx == raw_idx:
+            if target == cm.INIT and ret_raw_idx == raw_idx:
                 self.status = READY_FOR_TASKS
                 logger.info(f'{self.name} is ready for tasks')
                 return True
@@ -91,18 +127,21 @@ class Socket(cm.AbstractWorker):
             logger.info(f'{self.name} is dead')
             return
     
-    def send_task(self, data):
+    def send_task(self, idx_args):
         '''
         Sumbits task to the worker
-        :param data: [index, content]
+        :param idx_args: [index, args]
         '''
-        self.send_msg(cm.compose_msg(cm.TASK, cm.encode_int(data[0]), cm.dumpb(data[1])))
+        if SINGLETON_TASK:
+            self.send_msg(cm.compose_msg(cm.TASK, cm.encode_int(idx_args[0]), [cm.dumpb(idx_args[1])]))
+        else: 
+            self.send_msg(cm.compose_msg(cm.TASK, cm.encode_int(idx_args[0]), map(cm.dumpb, idx_args[1])))
 
     def get_task_result(self):
         msg, success = self.read_msg()
         assert success
         _, raw_idx, res = cm.decompose_msg(msg)
-        return cm.decode_int(raw_idx), cm.loadb(res)
+        return cm.decode_int(raw_idx), cm.loadb(res[0])
         
     def do_task(self, data):
         '''
@@ -272,7 +311,7 @@ class Sprint:
         self.ind_lookup = {} if with_inds else None
         self.requestors = {}
         self.log = Queue()
-        self.recycle = False
+        self.recycle = {}
         self.recycled = set() # for logging only
         self.chunksize = 1
 
@@ -296,11 +335,9 @@ class Sprint:
             self.not_empty.notify(len(tasks))
             return self.num_submitted_tasks
     
-    
     def submit_task(self, task, requestor='') -> int:
         return self.submit_tasks([task], requestor=requestor)
     
-
     def get_task(self, requestor=''):
         '''
         :return: the next task in the queue so as to execute it
@@ -315,9 +352,10 @@ class Sprint:
                         # new task, update records
                         self.in_progress[idx] = node
                         node.seen = True
-                    if self.recycle:
+                    if self.recycle.setdefault(node.requestor, True):
                         self.tasks.append(node) # let another worker pick it up...
                         self.recycled.add(idx)
+                        self.not_empty.notify()
                     else:
                         self.recycled.discard(idx)
                     return task_to_grab
@@ -363,24 +401,6 @@ class Sprint:
             self.nums_picked_res[requestor] += 1
             yield resp
 
-
-    def __iter__(self):
-        '''
-        for backward compatibility
-        '''
-        return self.yield_results()
-
-    def get_results(self, requestor='') -> list:
-        '''
-        For backward compatibility only
-        Get the remaining results in a list with 1-1 correspondence to the tasks
-        '''
-        result_pairs = list(self.yield_results(requestor=requestor))
-        results = [None] * (1 + max(item[0] for item in result_pairs))
-        for x, y in result_pairs:
-            results[x] = y
-        return results
-
     def is_done(self):
         return self.is_done_event.is_set()
     
@@ -389,23 +409,28 @@ class Sprint:
         Once the batch is closed, it is not to accept any more asks but can continue to
         work on already submitted ones.
         '''
-
         if self.open:
             self.open = False
-            self.start_recycle()
+            self.start_recycle(all=True)
+            self.not_empty.notify_all()
 
-    def start_recycle(self):
-        count = 0
+    def set_recycle(self, val: bool, all=False, requestor=''):
         with self.mutex:
-            self.recycle = True
-            for idx, node in self.in_progress.items():
-                if node not in self.tasks:
-                    self.tasks.append(node)
-                    self.recycled.add(idx)
-                    count += 1
-            self.not_empty.notify(count)
+            if all:
+                for r, v in self.recycle:
+                    self.recycle[r] = val
+            else:
+                self.recycle[requestor] = val
+            if val:
+                count = 0
+                for idx, node in self.in_progress.items():
+                    if node not in self.tasks and (all or node.requestor == requestor):
+                        self.tasks.append(node)
+                        self.recycled.add(idx)
+                        count += 1
+                self.not_empty.notify(count)
 
-
+            
 class SprintMan:
     '''
     A worker equipped with a queue for sprints to work on and a thread for working on them.
@@ -473,21 +498,14 @@ class Pool:
     '''
     A pool of workers
     '''
-    def __init__(self, command, num_workers=None, task_processor=None, initializer=None, calls={}, suffix=''):
-        # backward compatibility, want to only use calls
-        if not calls:  
-            calls = {
-                cm.TASK: task_processor,
-                # init data will arrive as a tuple
-                cm.INIT_DATA: lambda x: initializer(*x)  
-                }
+    def __init__(self, command, calls={}, suffix=''):
         self.suffix = suffix
         if num_workers is None:
             num_workers = SANE_WORKERS
         self.command = command
         logger.info(f'Worker command: {self.command}')
         self.workers = [] # it is useful to retain the order in which workers were created...
-        if task_processor:
+        if calls:
             self.house_worker = SprintMan(cm.HouseWorker(calls))
             self.house_worker.thread.start()
         else:
