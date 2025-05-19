@@ -2,50 +2,55 @@
 
 - Concurrent processes working on a time-consuming batch of tasks
 - Each worker takes tasks from a common queue
+- Each worker is assigned to a requestor.  When grabbing a task, a worker looks
+    for the earliest task from its requestor, and if there isn't any, the worker opts for
+    the first task in the queue.
 - New workers are launched in real time if calculation runs behind schedule
 - Inter-process communication via named unix sockets
 - Tests are in tests/.  These scripts also serve as examples.
 
 Basic usage:
 
-    # my_worker.py:
+    my_worker.py:
         #!/bin/python
-        from workerpool.worker import run
+        from swarm.worker import run
 
 
-        class TaskProcessor:
-            def __init__(self, ...)
-                # the usual
-
+        class Procesor:
             def initialize(self, *init_data):
                 # Initialize your task processor, optional...
 
-            def __call__(self, task):
+            def __call__(self, *task):
                 # Process task...
                 return result
 
 
         if __name__ == '__main__':
-            task_processor = TaskProcessor()
-            run(task_processor=task_processor, initializer=task_processor.initialize)     
+            processor = Processor()
+            run(task_processor=processor.__call__, initializer=processor.initialize)     
 
-    
     # app.py
-        from time import time
-        from workerpool.client import, Pool, Batch, BatchManager
+        from swarm.client import, Sprint, Pool
         
         # Run a pool of workers with target time of completion 1 minute from now...
-        with Pool(my_worker.py') as pool:
+        sprint = Sprint()
+        with Pool() as pool:
+            pool.submit_sprint(sprint)
+            sprint.submit_tasks(tasks)
+            results = sprint.yield_results()
+
+
+        with Pool('my_worker.py') as pool:
             # Prepare init_data, if needed, and a list of tasks
             batch_manager = BatchManager(pool, tasks, init_data=init_data)
             batch = BatchManager.batch
             batch.start(tta=time() + 60)
-            results = batch.get_results() # Results will be listed in the same order as tasks.
+            results = batch.list_results() # Results will be listed in the same order as tasks.
 
         # Low-level communication with a worker is also possible:
         worker = Socket(pid) # pid of the worker process
         worker.connect()
-        assert worker.initialize(init_data)
+        worker.initialize(init_data)
         # task_id is an identifier, task is the actual data to be sent for processing
         res_id, result = worker.do_task([task_id, task])  
         assert ret_id == task_id
