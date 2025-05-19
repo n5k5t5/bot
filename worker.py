@@ -5,6 +5,7 @@ import traceback
 from . import common as cm
 
 
+TASK, INIT = cm.TASK, cm.INIT
 LOGFREQ = 0
 
 
@@ -74,7 +75,13 @@ def run_socket(loop, suffix=''):
 
 
 # Use this to create a task-processing server to be used as a worker...
-def run(calls, suffix=''):
+def run(task_processor=None, initializer=None, calls=None, suffix=''):
+    if calls is None:
+        calls = {}
+    if task_processor:
+        calls[TASK] = task_processor
+    if initializer:
+        calls[INIT] = initializer
     loop = lambda i, o: worker_loop(i, o, calls)
     run_socket(loop, suffix=suffix)
 
