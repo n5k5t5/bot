@@ -4,13 +4,15 @@ from datetime import datetime
 import __main__
 
 
-SOCKET_FILE = '/var/run/socket_{pid}_{suffix}'
+SOCKET_FILE = '/tmp/socket_{pid}_{suffix}'
 BYTE_ORDER = 'little'
 INTSIZE = 8
+INIT = b'initialize'
+TASK = b'do_task'
 
 
 encode_int = lambda x: int.to_bytes(x, INTSIZE, BYTE_ORDER)
-decode_int = lambda y: int.from_bytes(y[:INTSIZE], BYTE_ORDER)
+decode_int = lambda y, i: int.from_bytes(y[i: i + INTSIZE], BYTE_ORDER)
 
 
 def send_msg(raw_msg: bytes, out_stream):
@@ -25,7 +27,7 @@ def read_msg(in_stream):
         return None, None
     elif len(header) < INTSIZE:
         raise Exception(f'Reading: header is too small: size {len(header)}')
-    msg_size = decode_int(header)
+    msg_size = decode_int(header, 0)
     raw_msg = in_stream.read(msg_size)
     return raw_msg, INTSIZE + msg_size  # or just anything that has a boolean value of True
 
@@ -39,14 +41,14 @@ def encode_iterable(args, msg=b''):
 def decode_iterable(msg, i=0):
     args = []
     while i < len(msg):
-        j = i + 1 + decode_int(msg[i])
-        args.append(msg[i + 1: j])
+        j = i + INTSIZE + decode_int(msg, i)
+        args.append(msg[i + INTSIZE: j])
         i = j
     return tuple(args)
 
 
 def decompose_msg(msg: bytes):
-    target_len = decode_int(msg)
+    target_len = decode_int(msg, 0)
     # target, raw_idx, args
     return msg[INTSIZE: INTSIZE + target_len], msg[INTSIZE + target_len: 2 * INTSIZE + target_len], \
         decode_iterable(msg, 2 * INTSIZE + target_len)
@@ -54,8 +56,7 @@ def decompose_msg(msg: bytes):
 
 def compose_msg(target: bytes, raw_idx: bytes, args: bytes):
     msg = encode_int(len(target)) + target + raw_idx
-    encode_iterable(args, msg)
-    return msg
+    return encode_iterable(args, msg)
 
 
 class Logger:
