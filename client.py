@@ -61,8 +61,11 @@ class HouseWorker(AbstractWorker):
     def initialize(self, init_data):
         return self.calls[INIT](*init_data)
         
-    def do_task(self, task):
-        return task[0], self.calls[TASK](*task[1])
+    def do_task(self, task, target=TASK):
+        if SINGLETON_TASK:
+            return task[0], self.calls[target](task[1])
+        else:
+            return task[0], self.calls[target](*task[1])
 
     def has_quit(self):
         return False
@@ -132,7 +135,7 @@ class Socket(AbstractWorker):
         :param idx_args: (index, args)
         '''
         if SINGLETON_TASK:
-            self.send_msg(cm.compose_msg(target, cm.encode_int(idx_args[0]), [cm.dumpb(idx_args[1])]))
+            self.send_msg(cm.compose_msg(target, cm.encode_int(idx_args[0]), (cm.dumpb(idx_args[1]),)))
         else: 
             self.send_msg(cm.compose_msg(target, cm.encode_int(idx_args[0]), map(cm.dumpb, idx_args[1])))
 
