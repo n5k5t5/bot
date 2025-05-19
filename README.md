@@ -31,6 +31,7 @@ Basic usage:
 
     # app.py
         from swarm.client import Socket, Sprint, Pool, BatchManager
+
         
         # Run a pool of workers with target time of completion 1 minute from now...
         sprint = Sprint()
