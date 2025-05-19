@@ -16,7 +16,7 @@ Basic usage:
         from swarm.worker import run
 
 
-        class Procesor:
+        class Processor:
             def initialize(self, *init_data):
                 # Initialize your task processor, optional...
 
