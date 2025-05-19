@@ -126,15 +126,15 @@ class Socket(AbstractWorker):
             logger.info(f'{self.name} is dead')
             return
     
-    def send_task(self, idx_args):
+    def send_task(self, idx_args, target=TASK):
         '''
         Sumbits task to the worker
-        :param idx_args: [index, args]
+        :param idx_args: (index, args)
         '''
         if SINGLETON_TASK:
-            self.send_msg(cm.compose_msg(TASK, cm.encode_int(idx_args[0]), [cm.dumpb(idx_args[1])]))
+            self.send_msg(cm.compose_msg(target, cm.encode_int(idx_args[0]), [cm.dumpb(idx_args[1])]))
         else: 
-            self.send_msg(cm.compose_msg(TASK, cm.encode_int(idx_args[0]), map(cm.dumpb, idx_args[1])))
+            self.send_msg(cm.compose_msg(target, cm.encode_int(idx_args[0]), map(cm.dumpb, idx_args[1])))
 
     def get_task_result(self):
         msg, success = self.read_msg()
@@ -142,12 +142,12 @@ class Socket(AbstractWorker):
         _, raw_idx, res = cm.decompose_msg(msg)
         return cm.decode_int(raw_idx, 0), cm.loadb(res[0])
         
-    def do_task(self, data):
+    def do_task(self, idx_args, target=TASK):
         '''
         Submits task to the worker and returns the result.
-        :param data: [index, content]
+        :param idx_args: (index, args)
         '''
-        self.send_task(data)
+        self.send_task(idx_args, target=target)
         return self.get_task_result()
 
     def has_quit(self):
