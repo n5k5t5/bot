@@ -2,15 +2,14 @@ import os
 import socket
 from time import time
 import traceback
-import common as cm
+from . import common as cm
 
 
-LOGFREQ = None
+LOGFREQ = 0
 
 
 # This loop is executed by the worker process...
-def worker_loop(input, output, worker):
-    worker.connect()
+def worker_loop(input, output, calls):
     counter = total_time = read_time = calc_time = send_time = msg_size = 0
     while True:
         try:
@@ -19,7 +18,9 @@ def worker_loop(input, output, worker):
             when_read = time()
             if not success:
                 return
-            res = worker.execute(msg)
+            target, raw_idx, args = cm.decompose_msg(msg)
+            func = calls[target]
+            res = cm.compose_msg(target, raw_idx, (cm.dumpb(func(*map(cm.loadb, args))),))
             when_calced = time()
             cm.send_msg(res, output)
             when_done = time()
@@ -73,21 +74,8 @@ def run_socket(loop, suffix=''):
 
 
 # Use this to create a task-processing server to be used as a worker...
-def run(task_processor=None, initializer=None, suffix='', calls=None):
-    '''
-    :param worker: 
-        example:
-            worker.initialize(INIT_DATA)
-            result = worker.do_task(task)
-    '''
-    # backward compatibiliy, want to only accept calls
-    if not calls:
-        calls = {
-            cm.TASK: task_processor,
-            cm.INIT_DATA: lambda x: initializer(*x)  
-            }
-    worker = cm.HouseWorker(calls)
-    loop = lambda i, o: worker_loop(i, o, worker)
+def run(calls, suffix=''):
+    loop = lambda i, o: worker_loop(i, o, calls)
     run_socket(loop, suffix=suffix)
 
 
