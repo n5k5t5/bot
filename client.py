@@ -22,10 +22,9 @@ SANE_WORKERS = os.cpu_count() or 12
 MAX_WORKERS = max(25, (3 * SANE_WORKERS) // 2)
 SPEED_ADJ = 100
 MIN_TIME_STEP = 5
-INIT = b'initialize'
-TASK = b'do_task'
 # True is for the old version
 SINGLETON_TASK = True
+TASK, INIT = cm.TASK, cm.INIT
 
 
 min_sec = lambda sec: f'{sec // 60 :.0f} min {sec % 60 :.0f} s'
@@ -54,16 +53,16 @@ class HouseWorker(AbstractWorker):
     '''
     def __init__(self, calls, name='House Worker'):
         '''
-        :param calls: {cm.INIT: callable, cm.TASK: callable, ...}
+        :param calls: {INIT: callable, TASK: callable, ...}
         '''
         self.calls = calls
         self.name = name
 
     def initialize(self, init_data):
-        return self.calls[cm.INIT](*init_data)
+        return self.calls[INIT](*init_data)
         
     def do_task(self, task):
-        return task[0], self.calls[cm.TASK](*task[1])
+        return task[0], self.calls[TASK](*task[1])
 
     def has_quit(self):
         return False
@@ -108,14 +107,14 @@ class Socket(AbstractWorker):
     
     def initialize(self, init_data):
         raw_idx = cm.encode_int(0)
-        msg = cm.compose_msg(cm.INIT, raw_idx, map(cm.dumpb, init_data))
+        msg = cm.compose_msg(INIT, raw_idx, map(cm.dumpb, init_data))
         self.send_msg(msg)
         logger.debug(f'Sent init data')
         msg, success = self.read_msg()
         logger.debug('Received init response')
         if success:
             target, ret_raw_idx, _ = cm.decompose_msg(msg)
-            if target == cm.INIT and ret_raw_idx == raw_idx:
+            if target == INIT and ret_raw_idx == raw_idx:
                 self.status = READY_FOR_TASKS
                 logger.info(f'{self.name} is ready for tasks')
                 return True
@@ -133,15 +132,15 @@ class Socket(AbstractWorker):
         :param idx_args: [index, args]
         '''
         if SINGLETON_TASK:
-            self.send_msg(cm.compose_msg(cm.TASK, cm.encode_int(idx_args[0]), [cm.dumpb(idx_args[1])]))
+            self.send_msg(cm.compose_msg(TASK, cm.encode_int(idx_args[0]), [cm.dumpb(idx_args[1])]))
         else: 
-            self.send_msg(cm.compose_msg(cm.TASK, cm.encode_int(idx_args[0]), map(cm.dumpb, idx_args[1])))
+            self.send_msg(cm.compose_msg(TASK, cm.encode_int(idx_args[0]), map(cm.dumpb, idx_args[1])))
 
     def get_task_result(self):
         msg, success = self.read_msg()
         assert success
         _, raw_idx, res = cm.decompose_msg(msg)
-        return cm.decode_int(raw_idx), cm.loadb(res[0])
+        return cm.decode_int(raw_idx, 0), cm.loadb(res[0])
         
     def do_task(self, data):
         '''
@@ -204,7 +203,6 @@ class Node:
         self.requestor = requestor
         self.rpred = None
         self.rsucc = None
-        self.seen = False
 
 
 class RequestorQueue:
@@ -311,14 +309,13 @@ class Sprint:
         self.ind_lookup = {} if with_inds else None
         self.requestors = {}
         self.log = Queue()
-        self.recycle = {}
-        self.recycled = set() # for logging only
+        self.recycle = {} # {requestor: True|False}
         self.chunksize = 1
 
     def submit_tasks(self, tasks, requestor='') -> int:
         '''
         Submit an ask for execution
-        :param ask:
+        :param tasks:
         :return: submission sequence number
         '''
         with self.mutex:
@@ -348,16 +345,12 @@ class Sprint:
                     node = self.tasks.popleft(requestor=requestor)
                     task_to_grab = node.task
                     idx = task_to_grab[0]
-                    if not node.seen:
-                        # new task, update records
-                        self.in_progress[idx] = node
-                        node.seen = True
+                    # idx might already be there...
+                    self.in_progress[idx] = node
+                    # A batch starts out with recycle set to True 
                     if self.recycle.setdefault(node.requestor, True):
                         self.tasks.append(node) # let another worker pick it up...
-                        self.recycled.add(idx)
                         self.not_empty.notify()
-                    else:
-                        self.recycled.discard(idx)
                     return task_to_grab
                 elif self.open:
                     self.not_empty.wait()
@@ -411,8 +404,9 @@ class Sprint:
         '''
         if self.open:
             self.open = False
-            self.start_recycle(all=True)
-            self.not_empty.notify_all()
+            self.set_recycle(True, all=True)
+            with self.mutex:
+                self.not_empty.notify_all()
 
     def set_recycle(self, val: bool, all=False, requestor=''):
         with self.mutex:
@@ -426,7 +420,6 @@ class Sprint:
                 for idx, node in self.in_progress.items():
                     if node not in self.tasks and (all or node.requestor == requestor):
                         self.tasks.append(node)
-                        self.recycled.add(idx)
                         count += 1
                 self.not_empty.notify(count)
 
@@ -482,7 +475,7 @@ class SprintMan:
             except Exception:
                 logger.error(traceback.format_exc())
                 return
-
+    
 
 class Batch(Sprint):
     def __init__(self, tasks, init_data=None, shuffle=False):
@@ -493,20 +486,34 @@ class Batch(Sprint):
         self.submit_tasks(tasks)
         self.close()
 
+    def list_results(self, requestor=''):
+        res_pairs = list(self.yield_results(requestor))
+        results = [None] * len(res_pairs)
+        for idx, res in res_pairs:
+            results[idx] = res
+        return results
+
 
 class Pool:
     '''
     A pool of workers
     '''
-    def __init__(self, command, calls={}, suffix=''):
+    def __init__(self, command, num_workers=None, calls=None, task_processor=None, initializer=None, suffix=''):
         self.suffix = suffix
         if num_workers is None:
             num_workers = SANE_WORKERS
         self.command = command
         logger.info(f'Worker command: {self.command}')
         self.workers = [] # it is useful to retain the order in which workers were created...
+        # for backward compatibility as well as convenience
+        if calls is None:
+            calls = {}
+        if task_processor is not None:
+            calls[TASK] = task_processor
+        if initializer is not None:
+            calls[INIT] = initializer
         if calls:
-            self.house_worker = SprintMan(cm.HouseWorker(calls))
+            self.house_worker = SprintMan(HouseWorker(calls))
             self.house_worker.thread.start()
         else:
             self.house_worker = None
