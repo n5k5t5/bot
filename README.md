@@ -3,7 +3,7 @@
 - Concurrent processes working on a time-consuming batch of tasks
 - Each worker takes tasks from a common queue
 - Each worker is assigned to a requestor.  When grabbing a task, a worker looks
-    for the earliest task from its requestor, and if there isn't any, the worker opts for
+    for the first task from its requestor, and if there isn't any, the worker opts for
     the first task in the queue.
 - New workers are launched in real time if calculation runs behind schedule
 - Inter-process communication via named unix sockets
