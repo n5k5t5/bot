@@ -30,7 +30,7 @@ Basic usage:
             run(task_processor=processor.__call__, initializer=processor.initialize)     
 
     # app.py
-        from swarm.client import, Sprint, Pool
+        from swarm.client import Sprint, Pool
         
         # Run a pool of workers with target time of completion 1 minute from now...
         sprint = Sprint()
